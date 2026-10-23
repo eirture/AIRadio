@@ -5,6 +5,7 @@
 #include "assets/lang_config.h"
 #include "settings.h"
 #include "board.h"
+#include "application.h"
 
 #include <vector>
 #include <cstring>
@@ -24,6 +25,55 @@ static SemaphoreHandle_t trans_done_sem = NULL;
 static uint16_t *trans_act;
 static uint16_t *trans_buf_1;
 static uint16_t *trans_buf_2;
+
+void CustomLcdDisplay::SetupUI() {
+    LcdDisplay::SetupUI();
+    if (!Lock(1000)) return;
+    if (content_) lv_obj_set_style_pad_bottom(content_, 112, 0);
+    intercom_bar_ = lv_obj_create(lv_screen_active());
+    lv_obj_set_size(intercom_bar_, LV_HOR_RES, 58);
+    lv_obj_align(intercom_bar_, LV_ALIGN_BOTTOM_MID, 0, -48);
+    lv_obj_set_style_radius(intercom_bar_, 0, 0);
+    lv_obj_set_style_border_width(intercom_bar_, 0, 0);
+    lv_obj_set_style_bg_color(intercom_bar_, lv_color_hex(0x173A36), 0);
+    lv_obj_set_style_pad_all(intercom_bar_, 5, 0);
+    intercom_button_ = lv_button_create(intercom_bar_);
+    lv_obj_set_size(intercom_button_, 132, 46);
+    lv_obj_align(intercom_button_, LV_ALIGN_RIGHT_MID, -60, 0);
+    intercom_label_ = lv_label_create(intercom_button_);
+    lv_obj_center(intercom_label_);
+    lv_obj_add_event_cb(intercom_button_, [](lv_event_t*) {
+        ESP_LOGI(TAG, "Intercom button pressed");
+    }, LV_EVENT_PRESSED, nullptr);
+    lv_obj_add_event_cb(intercom_button_, [](lv_event_t*) {
+        ESP_LOGI(TAG, "Intercom button clicked");
+        auto& app = Application::GetInstance();
+        app.Schedule([&app]() { app.GetIntercom().Press(); });
+    }, LV_EVENT_CLICKED, nullptr);
+    intercom_cancel_ = lv_button_create(intercom_bar_);
+    lv_obj_set_size(intercom_cancel_, 48, 46);
+    lv_obj_align(intercom_cancel_, LV_ALIGN_RIGHT_MID, 0, 0);
+    auto cancel_label = lv_label_create(intercom_cancel_);
+    lv_label_set_text(cancel_label, "X");
+    lv_obj_center(cancel_label);
+    lv_obj_add_event_cb(intercom_cancel_, [](lv_event_t*) {
+        auto& app = Application::GetInstance();
+        app.Schedule([&app]() { app.GetIntercom().Cancel(); });
+    }, LV_EVENT_CLICKED, nullptr);
+    Unlock();
+    UpdateIntercom();
+}
+
+void CustomLcdDisplay::UpdateIntercom() {
+    if (!intercom_label_ || !Lock(100)) return;
+    auto& intercom = Application::GetInstance().GetIntercom();
+    lv_label_set_text(intercom_label_, intercom.Status());
+    if (intercom.CanRecord() || strcmp(intercom.Status(), "发送") == 0) lv_obj_remove_state(intercom_button_, LV_STATE_DISABLED);
+    else lv_obj_add_state(intercom_button_, LV_STATE_DISABLED);
+    if (intercom.IsRecording()) lv_obj_remove_flag(intercom_cancel_, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(intercom_cancel_, LV_OBJ_FLAG_HIDDEN);
+    Unlock();
+}
 
 bool CustomLcdDisplay::lvgl_port_flush_io_ready_callback(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx)
 {

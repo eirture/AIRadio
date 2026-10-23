@@ -9,7 +9,13 @@ public:
     CustomLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel,
                   int width, int height, int offset_x, int offset_y,
                   bool mirror_x, bool mirror_y, bool swap_xy);
+    void SetupUI() override;
+    void UpdateIntercom() override;
 private:
+    lv_obj_t* intercom_bar_ = nullptr;
+    lv_obj_t* intercom_button_ = nullptr;
+    lv_obj_t* intercom_cancel_ = nullptr;
+    lv_obj_t* intercom_label_ = nullptr;
     static bool lvgl_port_flush_io_ready_callback(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx);
     static void lvgl_port_flush_callback(lv_display_t *drv, const lv_area_t *area, uint8_t *color_map);
 };

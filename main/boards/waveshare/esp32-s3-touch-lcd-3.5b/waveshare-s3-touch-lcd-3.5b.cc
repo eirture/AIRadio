@@ -277,10 +277,16 @@ private:
 
     void InitializeTouch()
     {
+        esp_err_t probe_err = i2c_master_probe(i2c_bus_,
+            ESP_LCD_TOUCH_IO_I2C_AXS15231B_ADDRESS, 100);
+        ESP_LOGI(TAG, "Touch I2C probe addr=0x%02x: %s",
+            ESP_LCD_TOUCH_IO_I2C_AXS15231B_ADDRESS, esp_err_to_name(probe_err));
+        ESP_LOGI(TAG, "Touch I2C probe addr=0x38 (FT5x06): %s",
+            esp_err_to_name(i2c_master_probe(i2c_bus_, 0x38, 100)));
         esp_lcd_touch_handle_t tp;
         esp_lcd_touch_config_t tp_cfg = {
-            .x_max = DISPLAY_WIDTH,
-            .y_max = DISPLAY_HEIGHT,
+            .x_max = DISPLAY_HEIGHT,
+            .y_max = DISPLAY_WIDTH,
             .rst_gpio_num = GPIO_NUM_NC,
             .int_gpio_num = GPIO_NUM_NC,
             .levels = {
@@ -290,7 +296,16 @@ private:
             .flags = {
                 .swap_xy = 1,
                 .mirror_x = 1,
-                .mirror_y = 1,
+                .mirror_y = 0,
+            },
+            .process_coordinates = [](esp_lcd_touch_handle_t, uint16_t* x,
+                                      uint16_t* y, uint16_t*, uint8_t* count, uint8_t) {
+                static int64_t last_log_us = 0;
+                int64_t now_us = esp_timer_get_time();
+                if (*count > 0 && now_us - last_log_us >= 200000) {
+                    last_log_us = now_us;
+                    ESP_LOGI(TAG, "Touch raw: x=%u y=%u count=%u", x[0], y[0], *count);
+                }
             },
         };
         esp_lcd_panel_io_handle_t tp_io_handle = NULL;
@@ -303,8 +318,19 @@ private:
             .disp = lv_display_get_default(), 
             .handle = tp,
         };
-        lvgl_port_add_touch(&touch_cfg);
-        ESP_LOGI(TAG, "Touch panel initialized successfully");
+        lv_indev_t* touch_indev = lvgl_port_add_touch(&touch_cfg);
+        if (touch_indev == nullptr) {
+            ESP_LOGE(TAG, "Failed to register touch input with LVGL");
+            return;
+        }
+        lv_indev_add_event_cb(touch_indev, [](lv_event_t* event) {
+            auto* indev = static_cast<lv_indev_t*>(lv_event_get_target(event));
+            lv_point_t point;
+            lv_indev_get_point(indev, &point);
+            ESP_LOGI(TAG, "Touch pressed: x=%ld y=%ld", static_cast<long>(point.x),
+                     static_cast<long>(point.y));
+        }, LV_EVENT_PRESSED, nullptr);
+        ESP_LOGI(TAG, "Touch panel initialized and registered with LVGL");
     }
 
 public:
