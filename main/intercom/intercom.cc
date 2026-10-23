@@ -4,6 +4,7 @@
 #include "board.h"
 #include "display.h"
 #include "settings.h"
+#include "assets/lang_config.h"
 
 #include <cJSON.h>
 #include <esp_heap_caps.h>
@@ -23,6 +24,8 @@ constexpr size_t kMinFreePsram = 1024 * 1024;
 constexpr int kFrameMs = 60;
 constexpr int kSampleRate = 16000;
 constexpr int kSamples = kFrameMs * kSampleRate / 1000;
+constexpr size_t kRealtimeFrameQueue = 12;
+constexpr int kJitterFrames = 8;
 constexpr char kTag[] = "Intercom";
 
 void LogConfig(const char *source, const std::string &id,
@@ -85,6 +88,16 @@ void Intercom::NetworkChanged(bool connected) {
     stop_recording_ = true;
     cancel_recording_ = true;
     session_failed_ = true;
+    {
+      std::lock_guard<std::mutex> lock(frame_mutex_);
+      outgoing_frames_.clear();
+    }
+    {
+      std::lock_guard<std::mutex> lock(incoming_mutex_);
+      incoming_buffer_.clear();
+      incoming_playback_started_ = false;
+      incoming_initialized_ = false;
+    }
     SetState(State::Disconnected);
     if (was_playing) {
       incoming_id_.clear();
@@ -124,13 +137,13 @@ const char *Intercom::Status() const {
       return "助手忙";
     if (!app_.GetAudioService().IsPlaybackIdle())
       return "音频播放中";
-    return "录音";
+    return "开始对讲";
   case State::Recording:
-    return "发送";
+    return "说话中";
   case State::Sending:
-    return "发送中";
+    return "说话中";
   case State::Playing:
-    return "播放中";
+    return "说话中";
   }
   return "对讲不可用";
 }
@@ -156,30 +169,32 @@ void Intercom::Press() {
              record_task_active_.load());
     return;
   }
-  if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) < kMinFreePsram + kMaxBytes) {
-    app_.Schedule([this]() {
-      Board::GetInstance().GetDisplay()->ShowNotification("PSRAM不足");
-    });
+  if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) < kMinFreePsram) {
+    ESP_LOGW(kTag, "Cannot start realtime talk: free PSRAM below reserve");
+    app_.Schedule([this]() { Board::GetInstance().GetDisplay()->ShowNotification("PSRAM不足"); });
     return;
   }
   app_.GetAudioService().EnableWakeWordDetection(false);
   stop_recording_ = cancel_recording_ = session_failed_ = false;
-  buffer_ = static_cast<uint8_t *>(
-      heap_caps_malloc(kMaxBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-  if (!buffer_) {
-    ResumeAssistantAudio();
-    app_.Schedule([this]() {
-      Board::GetInstance().GetDisplay()->ShowNotification("PSRAM分配失败");
-    });
-    return;
-  }
   frame_count_ = 0;
   bytes_ = 0;
+  {
+    std::lock_guard<std::mutex> lock(frame_mutex_);
+    outgoing_frames_.clear();
+  }
+  message_id_ = id_ + "-" + std::to_string(esp_random());
+  start_ok_ = false;
+  start_sent_ = SendText("{\"type\":\"start\",\"message_id\":\"" +
+                         message_id_ + "\",\"frame_ms\":60,\"sample_rate\":16000}");
+  if (!start_sent_) {
+    ESP_LOGW(kTag, "Failed to send realtime start message=%s", message_id_.c_str());
+    ResumeAssistantAudio();
+    return;
+  }
+  ESP_LOGI(kTag, "Realtime talk start sent message=%s", message_id_.c_str());
   record_started_ = esp_timer_get_time();
   if (!app_.GetAudioService().StartIntercomCapture()) {
     ESP_LOGW(kTag, "Audio capture refused to start");
-    heap_caps_free(buffer_);
-    buffer_ = nullptr;
     ResumeAssistantAudio();
     return;
   }
@@ -195,8 +210,6 @@ void Intercom::Press() {
     ESP_LOGE(kTag, "Failed to create recording task");
     record_task_active_ = false;
     app_.GetAudioService().StopIntercomCapture();
-    heap_caps_free(buffer_);
-    buffer_ = nullptr;
     SetState(State::Ready);
     ResumeAssistantAudio();
   }
@@ -204,6 +217,8 @@ void Intercom::Press() {
 
 void Intercom::Cancel() {
   if (state_ == State::Recording) {
+    ESP_LOGI(kTag, "Cancelling realtime talk message=%s frames=%d",
+             message_id_.c_str(), frame_count_);
     cancel_recording_ = true;
     stop_recording_ = true;
   }
@@ -311,7 +326,15 @@ void Intercom::RecordTask() {
     }
     if (bytes_ + out.encoded_bytes > kMaxBytes)
       break;
-    memcpy(buffer_ + bytes_, frame, out.encoded_bytes);
+    {
+      std::lock_guard<std::mutex> lock(frame_mutex_);
+      if (outgoing_frames_.size() >= kRealtimeFrameQueue) {
+        ESP_LOGW(kTag, "Realtime send queue full message=%s frames=%d", message_id_.c_str(), frame_count_);
+        session_failed_ = true;
+        break;
+      }
+      outgoing_frames_.emplace_back(frame, frame + out.encoded_bytes);
+    }
     frame_lengths_[frame_count_++] = out.encoded_bytes;
     bytes_ += out.encoded_bytes;
   }
@@ -325,8 +348,12 @@ void Intercom::RecordTask() {
              "frames=%d network=%d",
              cancel_recording_.load(), session_failed_.load(), frame_count_,
              network_.load());
-    heap_caps_free(buffer_);
-    buffer_ = nullptr;
+    if (start_sent_ && network_ && !session_failed_)
+      QueueText("{\"type\":\"abort\",\"message_id\":\"" + message_id_ + "\"}");
+    {
+      std::lock_guard<std::mutex> lock(frame_mutex_);
+      outgoing_frames_.clear();
+    }
     if (state_ == State::Recording)
       SetState(network_ && !session_failed_ ? State::Ready
                                             : State::Disconnected);
@@ -334,7 +361,9 @@ void Intercom::RecordTask() {
     record_task_active_ = false;
     return;
   }
-  SetState(State::Sending);
+  end_pending_ = true;
+  ESP_LOGI(kTag, "Realtime capture ended message=%s frames=%d bytes=%u",
+           message_id_.c_str(), frame_count_, static_cast<unsigned>(bytes_));
   record_task_active_ = false;
 }
 
@@ -366,41 +395,40 @@ void Intercom::FlushControl() {
 }
 
 void Intercom::Upload() {
-  size_t offset = 0;
-  message_id_ = id_ + "-" + std::to_string(esp_random());
-  start_ok_ = end_ok_ = false;
-  if (!SendText("{\"type\":\"start\",\"message_id\":\"" + message_id_ +
-                "\",\"frame_ms\":60,\"sample_rate\":16000}"))
-    goto done;
-  for (int i = 0; i < 80 && !start_ok_ && !session_failed_ && network_; ++i) {
-    FlushControl();
-    vTaskDelay(pdMS_TO_TICKS(50));
+  SendRealtimeFrames();
+}
+
+void Intercom::SendRealtimeFrames() {
+  std::vector<uint8_t> frame;
+  bool queue_empty = false;
+  {
+    std::lock_guard<std::mutex> lock(frame_mutex_);
+    if (!outgoing_frames_.empty()) {
+      frame = std::move(outgoing_frames_.front());
+      outgoing_frames_.pop_front();
+    }
+    queue_empty = outgoing_frames_.empty();
   }
-  if (!start_ok_)
-    goto done;
-  for (int i = 0; i < frame_count_; ++i) {
-    FlushControl();
-    if (!network_ || session_failed_ ||
-        !ws_->Send(buffer_ + offset, frame_lengths_[i], true))
-      goto done;
-    offset += frame_lengths_[i];
-    vTaskDelay(pdMS_TO_TICKS(kFrameMs));
+  if (!frame.empty() && ws_ && ws_->IsConnected()) {
+    if (!ws_->Send(frame.data(), frame.size(), true)) {
+      ESP_LOGW(kTag, "Realtime frame send failed message=%s", message_id_.c_str());
+      session_failed_ = true;
+    } else if (frame_count_ == 1) {
+      ESP_LOGD(kTag, "Realtime first frame sent message=%s bytes=%u", message_id_.c_str(), static_cast<unsigned>(frame.size()));
+    }
   }
-  if (!SendText("{\"type\":\"end\",\"message_id\":\"" + message_id_ +
-                "\",\"frame_count\":" + std::to_string(frame_count_) + "}"))
-    goto done;
-  for (int i = 0; i < 40 && !end_ok_ && !session_failed_ && network_; ++i) {
-    FlushControl();
-    vTaskDelay(pdMS_TO_TICKS(50));
+  if (end_pending_ && queue_empty && !record_task_active_ && !end_ok_) {
+    if (SendText("{\"type\":\"end\",\"message_id\":\"" + message_id_ +
+                 "\",\"frame_count\":" + std::to_string(frame_count_) + "}")) {
+      ESP_LOGI(kTag, "Realtime end sent message=%s frames=%d", message_id_.c_str(), frame_count_);
+      end_pending_ = false;
+      SetState(State::Sending);
+    }
   }
-done:
-  if (!end_ok_)
-    SendText("{\"type\":\"abort\"}");
-  heap_caps_free(buffer_);
-  buffer_ = nullptr;
-  SetState(network_ && ws_ && ws_->IsConnected() ? State::Ready
-                                                 : State::Disconnected);
-  ResumeAssistantAudio();
+  if (state_ == State::Sending && end_ok_) {
+    SetState(network_ && ws_ && ws_->IsConnected() ? State::Ready : State::Disconnected);
+    ResumeAssistantAudio();
+  }
 }
 
 void Intercom::OnData(const char *data, size_t len, bool binary) {
@@ -419,19 +447,26 @@ void Intercom::OnData(const char *data, size_t len, bool binary) {
     packet->sample_rate = kSampleRate;
     packet->frame_duration = kFrameMs;
     packet->payload.assign(data, data + len);
-    if (!app_.GetAudioService().PushPacketToDecodeQueue(std::move(packet))) {
-      ESP_LOGW(kTag, "Receive decode queue full: frames=%d", incoming_frames_);
-      QueueText("{\"type\":\"busy\",\"message_id\":\"" + incoming_id_ + "\"}");
-      app_.Schedule([this]() {
-        incoming_id_.clear();
-        playback_started_at_ = 0;
-        playback_ended_at_ = 0;
-        app_.GetAudioService().ResetDecoder();
-        SetState(State::Ready);
-        ResumeAssistantAudio();
-      });
-    } else
-      ++incoming_frames_;
+    std::lock_guard<std::mutex> lock(incoming_mutex_);
+    if (incoming_buffer_.size() >= 12) {
+      ESP_LOGW(kTag, "Receive jitter buffer full message=%s frames=%d", incoming_id_.c_str(), incoming_frames_);
+      incoming_id_.clear();
+      incoming_buffer_.clear();
+      incoming_playback_started_ = false;
+      app_.Schedule([this]() { app_.GetAudioService().ResetDecoder(); });
+      return;
+    }
+    incoming_buffer_.push_back(std::move(packet));
+    ++incoming_frames_;
+    if (incoming_initialized_ && (incoming_playback_started_ || incoming_buffer_.size() >= static_cast<size_t>(incoming_buffer_target_))) {
+      incoming_playback_started_ = true;
+      while (!incoming_buffer_.empty()) {
+        if (!app_.GetAudioService().TryPushPacketToDecodeQueue(incoming_buffer_.front()))
+          break;
+        incoming_buffer_.pop_front();
+      }
+      ESP_LOGD(kTag, "Receive jitter buffer primed message=%s frames=%d", incoming_id_.c_str(), incoming_frames_);
+    }
     return;
   }
   if (len > 1024)
@@ -460,6 +495,9 @@ void Intercom::OnData(const char *data, size_t len, bool binary) {
         rate->valueint == kSampleRate && CanRecord()) {
       incoming_id_ = mid;
       incoming_frames_ = 0;
+      incoming_buffer_target_ = kJitterFrames;
+      incoming_playback_started_ = false;
+      incoming_initialized_ = false;
       playback_started_at_ = esp_timer_get_time();
       playback_ended_at_ = 0;
       ESP_LOGI(kTag, "Receive start: message=%s", mid);
@@ -467,6 +505,8 @@ void Intercom::OnData(const char *data, size_t len, bool binary) {
       app_.Schedule([this, message = incoming_id_]() {
         app_.GetAudioService().EnableWakeWordDetection(false);
         app_.GetAudioService().ResetDecoder();
+        app_.GetAudioService().PlaySound(Lang::Sounds::OGG_POPUP);
+        incoming_initialized_ = true;
         QueueText("{\"type\":\"receive_ready\",\"message_id\":\"" + message +
                   "\"}");
         ESP_LOGI(kTag, "Receive ready queued: message=%s", message.c_str());
@@ -482,6 +522,21 @@ void Intercom::OnData(const char *data, size_t len, bool binary) {
     auto count = cJSON_GetObjectItem(json, "frame_count");
     ESP_LOGI(kTag, "Receive %s: message=%s expected=%d received=%d", name, mid,
              cJSON_IsNumber(count) ? count->valueint : -1, incoming_frames_);
+    {
+      std::lock_guard<std::mutex> lock(incoming_mutex_);
+      while (!incoming_buffer_.empty()) {
+        if (!app_.GetAudioService().TryPushPacketToDecodeQueue(incoming_buffer_.front()))
+          break;
+        incoming_buffer_.pop_front();
+      }
+      if (!incoming_buffer_.empty()) {
+        ESP_LOGW(kTag, "Dropping %u buffered frames at receive end: decode queue full",
+                 static_cast<unsigned>(incoming_buffer_.size()));
+        incoming_buffer_.clear();
+      }
+      incoming_playback_started_ = false;
+      incoming_initialized_ = false;
+    }
     if (strcmp(name, "abort") == 0 || !cJSON_IsNumber(count) ||
         count->valueint != incoming_frames_) {
       app_.Schedule([this]() { app_.GetAudioService().ResetDecoder(); });
@@ -523,8 +578,11 @@ void Intercom::NetworkTask() {
           ESP_LOGI(kTag, "Intercom server ready");
           while (network_ && ws_->IsConnected() && !session_failed_) {
             FlushControl();
-            if (state_ == State::Sending && !record_task_active_)
+            if ((state_ == State::Recording || state_ == State::Sending) &&
+                !record_task_active_)
               Upload();
+            else if (state_ == State::Recording || state_ == State::Sending)
+              SendRealtimeFrames();
             vTaskDelay(pdMS_TO_TICKS(30));
           }
         }
