@@ -77,6 +77,7 @@ void Application::Initialize() {
     auto codec = board.GetAudioCodec();
     audio_service_.Initialize(codec);
     audio_service_.Start();
+    intercom_.Start();
     ESP_LOGI(TAG, "After board/audio init");
     SystemInfo::PrintHeapStats();
 
@@ -147,7 +148,7 @@ void Application::Initialize() {
                 // WiFi config mode enter is handled by WifiBoard internally
                 break;
             case NetworkEvent::WifiConfigModeExit:
-                // WiFi config mode exit is handled by WifiBoard internally
+                ESP_LOGI(TAG, "Wi-Fi config mode exited; waiting for network connection to reload intercom settings");
                 break;
             // Cellular modem specific events
             case NetworkEvent::ModemDetecting:
@@ -218,6 +219,7 @@ void Application::Run() {
         }
 
         if (bits & MAIN_EVENT_PLAYBACK_DRAINED) {
+            intercom_.PlaybackDrained();
             if (audio_service_.IsPlaybackIdle()) {
                 notify_player_.OnPlaybackDrained();
             }
@@ -278,7 +280,9 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_CLOCK_TICK) {
             clock_ticks_++;
+            intercom_.Tick();
             auto display = Board::GetInstance().GetDisplay();
+            display->UpdateIntercom();
             display->UpdateStatusBar();
 
             // Print debug info every 10 seconds
@@ -297,6 +301,8 @@ void Application::Run() {
 
 void Application::HandleNetworkConnectedEvent() {
     ESP_LOGI(TAG, "Network connected");
+    intercom_.NetworkChanged(true);
+    ESP_LOGI(TAG, "Intercom state after Wi-Fi connection: %s", intercom_.Status());
     auto state = GetDeviceState();
 
     if (state == kDeviceStateStarting || state == kDeviceStateWifiConfiguring) {
@@ -323,6 +329,7 @@ void Application::HandleNetworkConnectedEvent() {
 }
 
 void Application::HandleNetworkDisconnectedEvent() {
+    intercom_.NetworkChanged(false);
     // Close current conversation when network disconnected
     auto state = GetDeviceState();
     if (state == kDeviceStateNotifying) {
@@ -791,6 +798,7 @@ void Application::StartListening() { xEventGroupSetBits(event_group_, MAIN_EVENT
 void Application::StopListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LISTENING); }
 
 void Application::HandleToggleChatEvent() {
+    if (intercom_.Busy()) return;
     auto state = GetDeviceState();
 
     if (state == kDeviceStateNotifying) {
@@ -932,7 +940,7 @@ void Application::HandleWakeWordDetectedEvent() {
             audio_service_.ResetDecoder();
             audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
             // Re-enable wake word detection as it was stopped by the detection itself
-            audio_service_.EnableWakeWordDetection(true);
+            if (!intercom_.Busy()) audio_service_.EnableWakeWordDetection(true);
         } else {
             // Play popup sound and start listening again
             play_popup_on_listening_ = true;
@@ -1030,7 +1038,7 @@ void Application::HandleStateChangedEvent() {
                     "neutral");  // Then set emotion (wechat mode checks child count)
             }
             audio_service_.EnableVoiceProcessing(false);
-            audio_service_.EnableWakeWordDetection(true);
+            if (!intercom_.Busy()) audio_service_.EnableWakeWordDetection(true);
             break;
         case kDeviceStateConnecting:
             display->SetStatus(Lang::Strings::CONNECTING);
@@ -1379,6 +1387,9 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
 }
 
 bool Application::CanEnterSleepMode() {
+    if (intercom_.Busy()) {
+        return false;
+    }
     if (GetDeviceState() != kDeviceStateIdle) {
         return false;
     }

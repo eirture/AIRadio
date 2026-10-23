@@ -20,6 +20,7 @@
 #include "device_state.h"
 #include "device_state_machine.h"
 #include "notify/notify_player.h"
+#include "intercom.h"
 
 // Main event bits
 #define MAIN_EVENT_SCHEDULE             (1 << 0)
@@ -118,6 +119,7 @@ public:
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
+    Intercom& GetIntercom() { return intercom_; }
     
     /**
      * Reset protocol resources (thread-safe)
@@ -142,6 +144,7 @@ private:
     std::string last_error_message_;
     std::string startup_wake_word_hint_message_;
     AudioService audio_service_;
+    Intercom intercom_{*this};
     NotifyPlayer notify_player_;
     uint32_t notification_playback_id_ = 0;
     std::unique_ptr<Ota> ota_;
