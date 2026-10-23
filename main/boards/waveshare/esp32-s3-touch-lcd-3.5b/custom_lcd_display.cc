@@ -68,7 +68,7 @@ void CustomLcdDisplay::UpdateIntercom() {
     if (!intercom_label_ || !Lock(100)) return;
     auto& intercom = Application::GetInstance().GetIntercom();
     lv_label_set_text(intercom_label_, intercom.Status());
-    if (intercom.CanRecord() || strcmp(intercom.Status(), "发送") == 0) lv_obj_remove_state(intercom_button_, LV_STATE_DISABLED);
+    if (intercom.CanRecord() || intercom.IsRecording()) lv_obj_remove_state(intercom_button_, LV_STATE_DISABLED);
     else lv_obj_add_state(intercom_button_, LV_STATE_DISABLED);
     if (intercom.IsRecording()) lv_obj_remove_flag(intercom_cancel_, LV_OBJ_FLAG_HIDDEN);
     else lv_obj_add_flag(intercom_cancel_, LV_OBJ_FLAG_HIDDEN);

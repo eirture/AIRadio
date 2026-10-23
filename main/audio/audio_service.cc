@@ -194,6 +194,7 @@ void AudioService::Stop() {
 }
 
 bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples) {
+    std::lock_guard<std::mutex> input_lock(input_read_mutex_);
     if (!codec_->input_enabled()) {
         esp_timer_stop(audio_power_timer_);
         esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
@@ -280,8 +281,12 @@ void AudioService::AudioInputTask() {
         }
 
         if (bits & AS_EVENT_INTERCOM_RUNNING) {
+            intercom_input_active_.store(true, std::memory_order_release);
             std::vector<int16_t> data;
-            if (ReadAudioData(data, 16000, OPUS_FRAME_DURATION_MS * 16)) {
+            const bool read_ok = ReadAudioData(data, 16000, OPUS_FRAME_DURATION_MS * 16);
+            const bool still_running =
+                (xEventGroupGetBits(event_group_) & AS_EVENT_INTERCOM_RUNNING) != 0;
+            if (read_ok && still_running) {
                 if (codec_->input_channels() == 2) {
                     for (size_t i = 0; i < data.size() / 2; ++i) data[i] = data[i * 2];
                     data.resize(data.size() / 2);
@@ -289,11 +294,12 @@ void AudioService::AudioInputTask() {
                 std::lock_guard<std::mutex> lock(audio_queue_mutex_);
                 if (!intercom_pcm_queue_.push_back(std::move(data))) intercom_capture_failed_ = true;
                 audio_queue_cv_.notify_all();
-            } else {
+            } else if (still_running) {
                 std::lock_guard<std::mutex> lock(audio_queue_mutex_);
                 intercom_capture_failed_ = true;
                 audio_queue_cv_.notify_all();
             }
+            intercom_input_active_.store(false, std::memory_order_release);
             continue;
         }
 
@@ -428,6 +434,14 @@ void AudioService::OpusCodecTask() {
             const uint32_t generation = playback_generation_;
             audio_queue_cv_.notify_all();
             lock.unlock();
+
+            if (!packet) {
+                ESP_LOGE(TAG, "Decode queue contained a null packet");
+                std::lock_guard<std::mutex> recovery_lock(audio_queue_mutex_);
+                decode_in_flight_ = false;
+                audio_queue_cv_.notify_all();
+                continue;
+            }
 
             AudioTask task;
             task.type = kAudioTaskTypeDecodeToPlaybackQueue;
@@ -653,6 +667,9 @@ bool AudioService::StartIntercomCapture() {
 }
 
 void AudioService::StopIntercomCapture() {
+    // Wait for a codec read and its vector writes to finish before clearing
+    // the intercom queue or allowing another audio mode to start.
+    std::lock_guard<std::mutex> input_lock(input_read_mutex_);
     xEventGroupClearBits(event_group_, AS_EVENT_INTERCOM_RUNNING);
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
     intercom_pcm_queue_.clear();
@@ -684,6 +701,21 @@ bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> pa
         }
     }
     if (service_stopped_.load() || generation != playback_generation_) {
+        return false;
+    }
+    playback_drained_notified_ = false;
+    audio_decode_queue_.push_back(std::move(packet));
+    audio_queue_cv_.notify_all();
+    return true;
+}
+
+bool AudioService::TryPushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket>& packet) {
+    if (!packet) {
+        ESP_LOGE(TAG, "Refusing null decode packet");
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    if (service_stopped_.load() || audio_decode_queue_.size() >= MAX_DECODE_PACKETS_IN_QUEUE) {
         return false;
     }
     playback_drained_notified_ = false;

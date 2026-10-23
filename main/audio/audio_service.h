@@ -144,6 +144,8 @@ public:
     void SetCallbacks(AudioServiceCallbacks& callbacks);
 
     bool PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait = false);
+    // Transfers ownership only when the decode queue accepts the packet.
+    bool TryPushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket>& packet);
     std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
     void PlaySound(const std::string_view& sound);
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
@@ -161,6 +163,8 @@ private:
     void* opus_encoder_ = nullptr;
     void* opus_decoder_ = nullptr;
     std::mutex decoder_mutex_;
+    // Serializes codec input reads with mode changes such as stopping intercom.
+    std::mutex input_read_mutex_;
     std::mutex input_resampler_mutex_;
     esp_ae_rate_cvt_handle_t input_resampler_ = nullptr;
     esp_ae_rate_cvt_handle_t output_resampler_ = nullptr;
@@ -196,6 +200,7 @@ private:
     FixedQueue<AudioTask, MAX_ENCODE_TASKS_IN_QUEUE> audio_encode_queue_;
     FixedQueue<std::vector<int16_t>, 2> intercom_pcm_queue_;
     bool intercom_capture_failed_ = false;
+    std::atomic<bool> intercom_input_active_{false};
     FixedQueue<AudioTask, MAX_PLAYBACK_TASKS_IN_QUEUE> audio_playback_queue_;
     bool decode_in_flight_ = false;
     bool output_in_flight_ = false;

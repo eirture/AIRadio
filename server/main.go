@@ -195,7 +195,9 @@ func (s *server) start(p *peer, c control) {
 			continue
 		}
 		other.mu.Lock()
-		other.receiving, other.ready = c.MessageID, false
+		// Realtime talk starts forwarding immediately. A receiver that cannot
+		// accept audio can still revoke the offer with a busy response.
+		other.receiving, other.ready = c.MessageID, true
 		if !other.send(control{Type: "start", SourceID: p.id, MessageID: c.MessageID, FrameMS: 60, SampleRate: 16000}) {
 			log.Printf("receive start queue full id=%s message=%s", other.id, c.MessageID)
 			other.receiving = ""
@@ -205,6 +207,9 @@ func (s *server) start(p *peer, c control) {
 		other.mu.Unlock()
 	}
 	started := s.started
+	if !p.send(answer("start_ack", c.MessageID, true, "")) {
+		log.Printf("start ack queue full id=%s message=%s", p.id, c.MessageID)
+	}
 	time.AfterFunc(35*time.Second, func() {
 		s.mu.Lock()
 		stalled := s.active == p && s.started.Equal(started)
@@ -214,19 +219,7 @@ func (s *server) start(p *peer, c control) {
 			p.close()
 		}
 	})
-	time.AfterFunc(readyTimeout+100*time.Millisecond, func() {
-		s.mu.Lock()
-		active := s.active == p && s.started.Equal(started) && p.sending == c.MessageID
-		s.mu.Unlock()
-		if active {
-			if !p.send(answer("start_ack", c.MessageID, true, "")) {
-				log.Printf("start ack queue full id=%s message=%s", p.id, c.MessageID)
-			} else {
-				log.Printf("start ack queued id=%s message=%s", p.id, c.MessageID)
-			}
-		}
-	})
-	log.Printf("start id=%s message=%s offered=%d", p.id, c.MessageID, offered)
+	log.Printf("start id=%s message=%s offered=%d ack=immediate", p.id, c.MessageID, offered)
 }
 
 func (s *server) frame(p *peer, data []byte) error {
