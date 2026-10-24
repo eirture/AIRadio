@@ -158,6 +158,10 @@ private:
     bool assets_version_checked_ = false;
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
     bool pending_listening_start_ = false;  // Waiting for playback to drain before starting listening (auto mode)
+    bool close_assistant_after_playback_ = false;
+    bool assistant_mcp_called_ = false;
+    std::string assistant_last_mcp_tool_;
+    void FinishAssistantReply();
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 

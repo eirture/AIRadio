@@ -73,6 +73,8 @@ bool WebsocketProtocol::IsAudioChannelOpened() const {
 
 void WebsocketProtocol::CloseAudioChannel(bool send_goodbye) {
     (void)send_goodbye;  // Websocket doesn't need to send goodbye message
+    ESP_LOGI(TAG, "CloseAudioChannel requested: has_socket=%d send_goodbye=%d",
+             websocket_ != nullptr, send_goodbye);
     websocket_.reset();
 }
 

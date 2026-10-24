@@ -1,18 +1,18 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <deque>
-#include <condition_variable>
-#include <vector>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
+#include "protocol.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <web_socket.h>
-#include "protocol.h"
 
 class Application;
 
@@ -30,6 +30,12 @@ public:
   const char *Status() const;
   const char *RoomName() const { return room_name_.c_str(); }
   bool CanRecord() const;
+  bool CreateRoom(const std::string &name,
+                  const std::vector<std::string> &invite_ids);
+  bool JoinRoom(const std::string &code);
+  bool LeaveRoom();
+  bool AcceptInvite(const std::string &code);
+  std::string ListRooms();
 
 private:
   enum class State {
@@ -66,6 +72,10 @@ private:
   std::atomic<bool> end_pending_{false};
   std::atomic<bool> start_sent_{false};
   std::mutex control_mutex_;
+  std::mutex rooms_mutex_;
+  std::condition_variable rooms_cv_;
+  std::string rooms_request_id_;
+  std::string rooms_response_;
   std::deque<std::string> pending_control_;
   std::mutex frame_mutex_;
   std::deque<std::vector<uint8_t>> outgoing_frames_;

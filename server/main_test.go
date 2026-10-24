@@ -174,7 +174,7 @@ func TestRoomsAreIsolatedAndJoinCodeMovesDevice(t *testing.T) {
 	_ = a
 	s.store.RegisterDevice("b", "")
 	s.store.RegisterDevice("c", "")
-	r, err := s.store.CreateRoom("隔离组", "a", []string{"a", "b"})
+	r, err := s.store.CreateRoom("隔离组", "a", []string{"b", "c"})
 	if err != nil || r.JoinCode == "" {
 		t.Fatalf("create room: %+v %v", r, err)
 	}
@@ -213,5 +213,24 @@ func TestDeviceCanCreateRoom(t *testing.T) {
 	}
 	if got := s.store.CurrentRoom("creator"); got.ID != r.ID {
 		t.Fatalf("creator room = %+v", got)
+	}
+}
+
+func TestListRoomsFiltersPermissions(t *testing.T) {
+	s := newServer()
+	s.store.RegisterDevice("a", "")
+	s.store.RegisterDevice("b", "")
+	open, _ := s.store.CreateRoom("开放", "a", nil)
+	restricted, _ := s.store.CreateRoom("受限", "a", []string{"b"})
+	hidden, _ := s.store.CreateRoom("隐藏", "a", []string{"c"})
+	seen := map[string]bool{}
+	for _, r := range s.listDeviceRooms("b") {
+		seen[r.ID] = true
+		if r.ID == restricted.ID && r.Code != restricted.JoinCode {
+			t.Fatal("missing join code")
+		}
+	}
+	if !seen["default"] || !seen[open.ID] || !seen[restricted.ID] || seen[hidden.ID] {
+		t.Fatalf("visible rooms: %v", seen)
 	}
 }
