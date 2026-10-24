@@ -167,3 +167,51 @@ func TestBadFrameAbortsAndReleasesBroadcast(t *testing.T) {
 		t.Fatalf("next ack: %+v", got)
 	}
 }
+
+func TestRoomsAreIsolatedAndJoinCodeMovesDevice(t *testing.T) {
+	s := newServer()
+	a := s.store.RegisterDevice("a", "")
+	_ = a
+	s.store.RegisterDevice("b", "")
+	s.store.RegisterDevice("c", "")
+	r, err := s.store.CreateRoom("隔离组", "a", []string{"a", "b"})
+	if err != nil || r.JoinCode == "" {
+		t.Fatalf("create room: %+v %v", r, err)
+	}
+	if got := s.store.CurrentRoom("c"); got.ID != "default" {
+		t.Fatalf("c room = %+v", got)
+	}
+	if _, err := s.store.Join("c", r.JoinCode); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.store.CurrentRoom("c"); got.ID != r.ID {
+		t.Fatalf("join room = %+v", got)
+	}
+	if got := s.store.CurrentRoom("a"); got.ID != r.ID {
+		t.Fatalf("a room = %+v", got)
+	}
+	if got := s.store.Leave("a"); got.ID != "default" {
+		t.Fatalf("leave room = %+v", got)
+	}
+	if err := s.store.CloseRoom(r.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.store.CurrentRoom("b"); got.ID != "default" {
+		t.Fatalf("closed room = %+v", got)
+	}
+}
+
+func TestDeviceCanCreateRoom(t *testing.T) {
+	s := newServer()
+	s.store.RegisterDevice("creator", "")
+	r, err := s.store.CreateRoom("语音创建", "creator", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.JoinCode) != 6 || r.Name != "语音创建" {
+		t.Fatalf("room = %+v", r)
+	}
+	if got := s.store.CurrentRoom("creator"); got.ID != r.ID {
+		t.Fatalf("creator room = %+v", got)
+	}
+}
