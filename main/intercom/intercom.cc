@@ -141,7 +141,7 @@ const char *Intercom::Status() const {
   case State::Recording:
     return "说话中";
   case State::Sending:
-    return "说话中";
+    return "发送中";
   case State::Playing:
     return "说话中";
   }
@@ -162,6 +162,7 @@ void Intercom::Press() {
   if (state_ == State::Recording) {
     ESP_LOGI(kTag, "Stopping recording: frames=%d", frame_count_);
     stop_recording_ = true;
+    SetState(State::Sending);
     return;
   }
   if (!CanRecord() || record_task_active_) {
@@ -184,6 +185,8 @@ void Intercom::Press() {
   }
   message_id_ = id_ + "-" + std::to_string(esp_random());
   start_ok_ = false;
+  end_ok_ = false;
+  end_pending_ = false;
   start_sent_ = SendText("{\"type\":\"start\",\"message_id\":\"" +
                          message_id_ + "\",\"frame_ms\":60,\"sample_rate\":16000}");
   if (!start_sent_) {
@@ -440,6 +443,14 @@ void Intercom::OnData(const char *data, size_t len, bool binary) {
                incoming_frames_);
       return;
     }
+    // WebCodecs may emit tiny DTX packets. The ESP Opus decoder used by the
+    // audio service does not accept those packets reliably, so discard them
+    // before they enter the jitter/decode queues.
+    if (len < 8) {
+      ESP_LOGW(kTag, "Dropping too-small Opus frame: bytes=%u",
+               static_cast<unsigned>(len));
+      return;
+    }
     if (incoming_frames_ == 0)
       ESP_LOGI(kTag, "First receive frame: bytes=%u",
                static_cast<unsigned>(len));
@@ -477,8 +488,10 @@ void Intercom::OnData(const char *data, size_t len, bool binary) {
   auto type = cJSON_GetObjectItem(json, "type");
   auto id = cJSON_GetObjectItem(json, "message_id");
   auto ok = cJSON_GetObjectItem(json, "ok");
+  auto room_name = cJSON_GetObjectItem(json, "room_name");
   const char *name = cJSON_IsString(type) ? type->valuestring : "";
   const char *mid = cJSON_IsString(id) ? id->valuestring : "";
+  if (cJSON_IsString(room_name)) room_name_ = room_name->valuestring;
   if (!strcmp(name, "hello_ack"))
     hello_ok_ = cJSON_IsTrue(ok);
   else if (!strcmp(name, "start_ack") && message_id_ == mid) {

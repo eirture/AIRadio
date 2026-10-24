@@ -115,6 +115,7 @@ void AudioService::Initialize(AudioCodec* codec) {
 }
 
 void AudioService::Start() {
+    ESP_LOGI(TAG, "AudioService intercom resampler safety build=2026-10-24-r2");
     service_stopped_.store(false);
     xEventGroupClearBits(event_group_, AS_EVENT_INTERCOM_RUNNING | AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING |
                                            AS_EVENT_AUDIO_PROCESSOR_RUNNING |
@@ -195,6 +196,13 @@ void AudioService::Stop() {
 
 bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples) {
     std::lock_guard<std::mutex> input_lock(input_read_mutex_);
+    // StopIntercomCapture() clears the event before waiting for this mutex.
+    // Re-check it after acquiring the lock so a stale AudioInputTask wakeup
+    // cannot read the codec after intercom has already stopped.
+    if (intercom_input_active_.load(std::memory_order_acquire) &&
+        !(xEventGroupGetBits(event_group_) & AS_EVENT_INTERCOM_RUNNING)) {
+        return false;
+    }
     if (!codec_->input_enabled()) {
         esp_timer_stop(audio_power_timer_);
         esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
@@ -212,11 +220,32 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
             uint32_t output_samples = 0;
             esp_ae_rate_cvt_get_max_out_sample_num(input_resampler_, in_sample_num,
                                                    &output_samples);
-            auto resampled = std::vector<int16_t>(output_samples * codec_->input_channels());
-            uint32_t actual_output = output_samples;
+            // Some IDF resampler versions report a per-channel estimate here
+            // but may produce more samples for the first block after a mode
+            // switch. Allocate from the input size as a safe upper bound and
+            // pass that capacity to the converter.
+            // The codec can return a short first block after switching from
+            // intercom capture back to the assistant path. Keep a generous
+            // fixed bound so an incorrect estimator can never undersize the
+            // destination buffer.
+            constexpr uint32_t kMaxResampledSamples = 4096;
+            const uint32_t safe_output_samples = std::max<uint32_t>(
+                output_samples, kMaxResampledSamples);
+            auto resampled = std::vector<int16_t>(
+                static_cast<size_t>(safe_output_samples) * codec_->input_channels());
+            uint32_t actual_output = safe_output_samples;
             esp_ae_rate_cvt_process(input_resampler_, (esp_ae_sample_t)data.data(), in_sample_num,
                                     (esp_ae_sample_t)resampled.data(), &actual_output);
-            resampled.resize(actual_output * codec_->input_channels());
+            // Treat the resampler's reported count as untrusted. A bad or
+            // stale codec transition must never turn resize() into an
+            // out-of-bounds allocation/free after intercom stops.
+            if (actual_output > safe_output_samples) {
+                ESP_LOGE(TAG, "Input resampler returned too many samples: %u > %u",
+                         static_cast<unsigned>(actual_output),
+                         static_cast<unsigned>(safe_output_samples));
+                return false;
+            }
+            resampled.resize(static_cast<size_t>(actual_output) * codec_->input_channels());
             data = std::move(resampled);
         }
     } else {
@@ -468,7 +497,11 @@ void AudioService::OpusCodecTask() {
                 std::unique_lock<std::mutex> decoder_lock(decoder_mutex_);
                 auto ret = esp_opus_dec_decode(opus_decoder_, &raw, &out_frame, &dec_info);
                 decoder_lock.unlock();
-                if (ret == ESP_AUDIO_ERR_OK) {
+                const size_t pcm_capacity = task.pcm.size();
+                if (ret == ESP_AUDIO_ERR_OK &&
+                    out_frame.decoded_size > 0 &&
+                    out_frame.decoded_size <= pcm_capacity * sizeof(int16_t) &&
+                    out_frame.decoded_size % sizeof(int16_t) == 0) {
                     task.pcm.resize(out_frame.decoded_size / sizeof(int16_t));
                     static int64_t last_decode_log_us = 0;
                     int64_t now_us = esp_timer_get_time();
@@ -669,8 +702,8 @@ bool AudioService::StartIntercomCapture() {
 void AudioService::StopIntercomCapture() {
     // Wait for a codec read and its vector writes to finish before clearing
     // the intercom queue or allowing another audio mode to start.
-    std::lock_guard<std::mutex> input_lock(input_read_mutex_);
     xEventGroupClearBits(event_group_, AS_EVENT_INTERCOM_RUNNING);
+    std::lock_guard<std::mutex> input_lock(input_read_mutex_);
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
     intercom_pcm_queue_.clear();
     audio_queue_cv_.notify_all();
