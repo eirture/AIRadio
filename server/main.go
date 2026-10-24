@@ -29,23 +29,45 @@ const (
 var validID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,32}$`)
 
 type control struct {
-	Type            string   `json:"type"`
-	Version         int      `json:"version,omitempty"`
-	DeviceID        string   `json:"device_id,omitempty"`
-	SourceID        string   `json:"source_id,omitempty"`
-	MessageID       string   `json:"message_id,omitempty"`
-	FrameMS         int      `json:"frame_ms,omitempty"`
-	SampleRate      int      `json:"sample_rate,omitempty"`
-	FrameCount      int      `json:"frame_count,omitempty"`
-	OK              *bool    `json:"ok,omitempty"`
-	Error           string   `json:"error,omitempty"`
-	Receivers       int      `json:"receivers,omitempty"`
-	RoomID          string   `json:"room_id,omitempty"`
-	RoomName        string   `json:"room_name,omitempty"`
-	Code            string   `json:"code,omitempty"`
-	Name            string   `json:"name,omitempty"`
-	DeviceIDs       []string `json:"device_ids,omitempty"`
-	InviteDeviceIDs []string `json:"invite_device_ids,omitempty"`
+	RequestID       string        `json:"request_id,omitempty"`
+	Rooms           *[]listedRoom `json:"rooms,omitempty"`
+	Type            string        `json:"type"`
+	Version         int           `json:"version,omitempty"`
+	DeviceID        string        `json:"device_id,omitempty"`
+	SourceID        string        `json:"source_id,omitempty"`
+	MessageID       string        `json:"message_id,omitempty"`
+	FrameMS         int           `json:"frame_ms,omitempty"`
+	SampleRate      int           `json:"sample_rate,omitempty"`
+	FrameCount      int           `json:"frame_count,omitempty"`
+	OK              *bool         `json:"ok,omitempty"`
+	Error           string        `json:"error,omitempty"`
+	Receivers       int           `json:"receivers,omitempty"`
+	RoomID          string        `json:"room_id,omitempty"`
+	RoomName        string        `json:"room_name,omitempty"`
+	Code            string        `json:"code,omitempty"`
+	Name            string        `json:"name,omitempty"`
+	DeviceIDs       []string      `json:"device_ids,omitempty"`
+	InviteDeviceIDs []string      `json:"invite_device_ids,omitempty"`
+}
+
+type listedRoom struct {
+	ID      string `json:"room_id"`
+	Name    string `json:"room_name"`
+	Default bool   `json:"is_default"`
+	Current bool   `json:"is_current"`
+	CanJoin bool   `json:"can_join"`
+	Code    string `json:"code"`
+}
+
+func (s *server) listDeviceRooms(id string) []listedRoom {
+	current := s.store.CurrentRoom(id).ID
+	out := []listedRoom{}
+	for _, r := range s.store.ListRooms() {
+		if r.Default || len(r.Invited) == 0 || r.CreatedBy == id || contains(r.Invited, id) {
+			out = append(out, listedRoom{r.ID, r.Name, r.Default, r.ID == current, true, r.JoinCode})
+		}
+	}
+	return out
 }
 
 func answer(t, id string, ok bool, reason string) control {
@@ -395,6 +417,19 @@ func (s *server) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		switch c.Type {
+		case "list_rooms":
+			if c.RequestID == "" || len(c.RequestID) > 64 {
+				p.send(control{Type: "list_rooms_ack", RequestID: c.RequestID, OK: boolPtr(false), Error: "invalid request_id"})
+				break
+			}
+			rooms := s.listDeviceRooms(p.id)
+			response := control{Type: "list_rooms_ack", RequestID: c.RequestID, OK: boolPtr(true), Rooms: &rooms}
+			encoded, _ := json.Marshal(response)
+			if len(encoded) > 8192 {
+				response = control{Type: "list_rooms_ack", RequestID: c.RequestID, OK: boolPtr(false), Error: "room list exceeds 8192 bytes"}
+			}
+			p.send(response)
+			log.Printf("debug list rooms device=%s request=%s count=%d", p.id, c.RequestID, len(rooms))
 		case "start":
 			log.Printf("debug ws control device=%s type=start message=%s room=%s", p.id, c.MessageID, s.store.CurrentRoom(p.id).ID)
 			s.start(p, c)

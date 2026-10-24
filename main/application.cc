@@ -220,6 +220,7 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_PLAYBACK_DRAINED) {
             intercom_.PlaybackDrained();
+            FinishAssistantReply();
             if (audio_service_.IsPlaybackIdle()) {
                 notify_player_.OnPlaybackDrained();
             }
@@ -338,6 +339,7 @@ void Application::HandleNetworkDisconnectedEvent() {
     if (state == kDeviceStateConnecting || state == kDeviceStateListening ||
         state == kDeviceStateSpeaking) {
         ESP_LOGI(TAG, "Closing audio channel due to network disconnection");
+        ESP_LOGI(TAG, "Assistant local close requested: %s:%d", __func__, __LINE__);
         protocol_->CloseAudioChannel();
     }
 
@@ -578,6 +580,12 @@ void Application::InitializeProtocol() {
     });
 
     protocol_->OnAudioChannelOpened([this, codec, &board]() {
+        Schedule([this]() {
+            ESP_LOGI(TAG, "Assistant lifecycle debug=r3 channel opened; reset MCP flags");
+            assistant_last_mcp_tool_.clear();
+            assistant_mcp_called_ = false;
+            close_assistant_after_playback_ = false;
+        });
         board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
         if (protocol_->server_sample_rate() != codec->output_sample_rate()) {
             ESP_LOGW(TAG,
@@ -588,8 +596,11 @@ void Application::InitializeProtocol() {
     });
 
     protocol_->OnAudioChannelClosed([this, &board]() {
+        ESP_LOGI(TAG, "Assistant channel closed callback received");
         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
         Schedule([this]() {
+            assistant_mcp_called_ = false;
+            close_assistant_after_playback_ = false;
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
             SetDeviceState(kDeviceStateIdle);
@@ -643,16 +654,24 @@ void Application::InitializeProtocol() {
             }
             if (strcmp(state->valuestring, "start") == 0) {
                 Schedule([this]() {
+                    ESP_LOGI(TAG, "Assistant TTS start: state=%d mcp=%d tool=%s",
+                             static_cast<int>(GetDeviceState()), assistant_mcp_called_,
+                             assistant_last_mcp_tool_.c_str());
                     aborted_ = false;
+                    close_assistant_after_playback_ = false;
                     SetDeviceState(kDeviceStateSpeaking);
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
                 Schedule([this]() {
                     if (GetDeviceState() == kDeviceStateSpeaking) {
-                        if (listening_mode_ == kListeningModeManualStop) {
-                            SetDeviceState(kDeviceStateIdle);
+                        ESP_LOGI(TAG, "Assistant TTS stop: mcp_called=%d tool=%s",
+                                 assistant_mcp_called_, assistant_last_mcp_tool_.c_str());
+                        if (assistant_mcp_called_) {
+                            close_assistant_after_playback_ = true;
+                            FinishAssistantReply();
                         } else {
-                            SetDeviceState(kDeviceStateListening);
+                            SetDeviceState(listening_mode_ == kListeningModeManualStop
+                                               ? kDeviceStateIdle : kDeviceStateListening);
                         }
                     }
                 });
@@ -697,6 +716,25 @@ void Application::InitializeProtocol() {
         } else if (strcmp(type->valuestring, "mcp") == 0) {
             auto payload = cJSON_GetObjectItem(root, "payload");
             if (cJSON_IsObject(payload)) {
+                auto method = cJSON_GetObjectItem(payload, "method");
+                auto request_id = cJSON_GetObjectItem(payload, "id");
+                ESP_LOGI(TAG, "Assistant MCP incoming: method=%s id=%d",
+                         cJSON_IsString(method) ? method->valuestring : "response",
+                         cJSON_IsNumber(request_id) ? request_id->valueint : -1);
+                if (cJSON_IsString(method) && strcmp(method->valuestring, "tools/call") == 0) {
+                    auto params = cJSON_GetObjectItem(payload, "params");
+                    auto tool = cJSON_GetObjectItem(params, "name");
+                    std::string tool_name = cJSON_IsString(tool) ? tool->valuestring : "unknown";
+                    Schedule([this, tool_name]() {
+                        ESP_LOGI(TAG, "Assistant MCP tools/call: %s", tool_name.c_str());
+                        if (tool_name == "self.get_device_status") {
+                            ESP_LOGI(TAG, "Assistant automatic status query; keep conversation open");
+                            return;
+                        }
+                        assistant_last_mcp_tool_ = tool_name;
+                        assistant_mcp_called_ = true;
+                    });
+                }
                 McpServer::GetInstance().ParseMessage(payload);
             }
         } else if (strcmp(type->valuestring, "system") == 0) {
@@ -836,6 +874,7 @@ void Application::HandleToggleChatEvent() {
     } else if (state == kDeviceStateSpeaking) {
         AbortSpeaking(kAbortReasonNone);
     } else if (state == kDeviceStateListening) {
+        ESP_LOGI(TAG, "Assistant local close requested: %s:%d", __func__, __LINE__);
         protocol_->CloseAudioChannel();
     }
 }
@@ -1114,7 +1153,9 @@ void Application::ShowStartupWakeWordHint() {
         if (!words.empty()) {
             words += " / ";
         }
-        words += *it;
+        // WakeNet exposes its phonetic model label; show a readable phrase
+        // without changing the word used for detection or protocol messages.
+        words += (*it == "Ni3Hao3Xiao3Zhi4") ? "你好，小智" : *it;
     }
     if (words.empty()) {
         ESP_LOGW(TAG, "Startup wake word hint skipped: no available wake words");
@@ -1285,6 +1326,7 @@ void Application::Reboot() {
     }
     // Disconnect the audio channel
     if (protocol_ && protocol_->IsAudioChannelOpened()) {
+        ESP_LOGI(TAG, "Assistant local close requested: %s:%d", __func__, __LINE__);
         protocol_->CloseAudioChannel();
     }
     protocol_.reset();
@@ -1308,6 +1350,7 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
     // Close audio channel if it's open
     if (protocol_ && protocol_->IsAudioChannelOpened()) {
         ESP_LOGI(TAG, "Closing audio channel before firmware upgrade");
+        ESP_LOGI(TAG, "Assistant local close requested: %s:%d", __func__, __LINE__);
         protocol_->CloseAudioChannel();
     }
     ESP_LOGI(TAG, "Starting firmware upgrade from URL: %s", upgrade_url.c_str());
@@ -1380,6 +1423,7 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
     } else if (state == kDeviceStateListening) {
         Schedule([this]() {
             if (protocol_) {
+                ESP_LOGI(TAG, "Assistant local close requested: %s:%d", __func__, __LINE__);
                 protocol_->CloseAudioChannel();
             }
         });
@@ -1444,12 +1488,39 @@ void Application::SetAecMode(AecMode mode) {
 
         // If the AEC mode is changed, close the audio channel
         if (protocol_ && protocol_->IsAudioChannelOpened()) {
+            ESP_LOGI(TAG, "Assistant local close requested: %s:%d", __func__, __LINE__);
             protocol_->CloseAudioChannel();
         }
     });
 }
 
 void Application::PlaySound(const std::string_view& sound) { audio_service_.PlaySound(sound); }
+
+void Application::FinishAssistantReply() {
+    // Called only on the application task. A server tts/stop marks the end
+    // of the response, but decoded audio may still be waiting for playback.
+    ESP_LOGI(TAG, "Assistant playback check: state=%d close_pending=%d mcp=%d tool=%s idle=%d aborted=%d",
+             static_cast<int>(GetDeviceState()), close_assistant_after_playback_,
+             assistant_mcp_called_, assistant_last_mcp_tool_.c_str(),
+             audio_service_.IsPlaybackIdle(), aborted_);
+    if (!close_assistant_after_playback_ || !assistant_mcp_called_ ||
+        assistant_last_mcp_tool_.empty() || !audio_service_.IsPlaybackIdle()) {
+        return;
+    }
+    close_assistant_after_playback_ = false;
+    assistant_mcp_called_ = false;
+    assistant_last_mcp_tool_.clear();
+    if (GetDeviceState() != kDeviceStateSpeaking || aborted_) {
+        return;
+    }
+    pending_listening_start_ = false;
+    ESP_LOGI(TAG, "Assistant reply playback finished; closing assistant audio channel");
+    if (protocol_) {
+        ESP_LOGI(TAG, "Assistant local close requested: %s:%d", __func__, __LINE__);
+        protocol_->CloseAudioChannel();
+    }
+    SetDeviceState(kDeviceStateIdle);
+}
 
 void Application::ResetProtocol() {
     Schedule([this]() {
@@ -1458,6 +1529,7 @@ void Application::ResetProtocol() {
         }
         // Close audio channel if opened
         if (protocol_ && protocol_->IsAudioChannelOpened()) {
+            ESP_LOGI(TAG, "Assistant local close requested: %s:%d", __func__, __LINE__);
             protocol_->CloseAudioChannel();
         }
         // Reset protocol

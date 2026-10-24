@@ -328,3 +328,40 @@
 ```
 
 成功返回 `accept_room_invite_ack`，随后发送 `room_state`。`room_state` 只表示该设备当前活动房间发生切换，不表示房间属性更新。
+
+## 8. WebSocket 房间列表查询
+
+已注册设备发送（不需要管理端 Cookie）：
+
+```json
+{"type":"list_rooms","request_id":"rooms-1"}
+```
+
+| 字段 | 类型 | 规则 |
+|---|---|---|
+| type | string | 固定 list_rooms |
+| request_id | string | 必填，1～64 字节；客户端生成，用于匹配响应 |
+
+成功响应：
+
+```json
+{"type":"list_rooms_ack","request_id":"rooms-1","ok":true,"rooms":[{"room_id":"default","room_name":"默认房间","is_default":true,"is_current":true,"can_join":true,"code":""}]}
+```
+
+| 响应字段 | 类型 | 说明 |
+|---|---|---|
+| type | string | 固定 list_rooms_ack |
+| request_id | string | 原样回传请求标识 |
+| ok | boolean | 查询是否成功 |
+| error | string | 失败原因；成功时省略 |
+| rooms | array | 可加入的未关闭房间；失败时省略 |
+| rooms[].room_id | string | 稳定房间 ID |
+| rooms[].room_name | string | 房间名称 |
+| rooms[].is_default | boolean | 是否默认房间 |
+| rooms[].is_current | boolean | 本机当前是否处于此房间 |
+| rooms[].can_join | boolean | 是否允许本机加入；当前返回的房间均为 true |
+| rooms[].code | string | 六位加入码，保留前导零；默认房间为空字符串 |
+
+服务端只返回默认房间、开放房间、本机创建或本机受邀房间，避免泄露其它受限房间加入码。响应最大 8192 字节，超出时返回 ok:false 和错误原因，不静默截断。请求控制帧仍限制 1024 字节。
+
+固件工具 `self.intercom.list_rooms` 通过独立工作任务查询，最多等待 5 秒，返回实际响应 JSON 或明确错误；不阻塞应用主任务。可说“当前有哪些对讲房间，加入码是什么”。默认房间通过 leave_room 返回，不使用空加入码加入。

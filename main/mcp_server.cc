@@ -122,208 +122,311 @@ void McpServer::AddCommonTools() {
 }
 
 void McpServer::AddUserOnlyTools() {
-    // System tools
-    AddUserOnlyTool("self.get_system_info", "Get the system information", PropertyList(),
-                    [this](const PropertyList& properties) -> ReturnValue {
-                        auto& board = Board::GetInstance();
-                        return board.GetSystemInfoJson();
+  auto &intercom = Application::GetInstance().GetIntercom();
+  AddTool(
+      "self.intercom.list_rooms",
+      "查询本机可以加入的对讲房间列表。用户问‘当前有哪些房间’‘有哪些对讲群’"
+      "‘列出房间和加入码’时调用。返回服务端实际房间名称、稳定ID、六位加入码、"
+      "是否当前房间和是否默认房间。逐位朗读加入码并保留前导零；默认房间没有加入"
+      "码。"
+      "只列出开放、本机受邀或本机创建的有效房间。查询失败时说明失败原因，不要编"
+      "造列表。",
+      PropertyList(), [&intercom](const PropertyList &) -> ReturnValue {
+        return intercom.ListRooms();
+      });
+  AddTool("self.intercom.get_current_room",
+          "查询本机当前所在的对讲房间，返回 room_name（房间名称）。"
+          "用户问‘我在哪个房间’‘当前对讲群是什么’‘现在在哪个频道’‘查看当前房间’"
+          "时调用。"
+          "这里的房间、群组、频道均指设备语音对讲房间。不要猜测房间名称，应根据"
+          "工具结果回答。",
+          PropertyList(), [&intercom](const PropertyList &) -> ReturnValue {
+            cJSON *j = cJSON_CreateObject();
+            cJSON_AddStringToObject(j, "room_name", intercom.RoomName());
+            return j;
+          });
+  AddTool("self.intercom.create_room",
+          "创建新的语音对讲房间。用户说‘创建房间’‘建个对讲群’‘新建频道’"
+          "‘创建一个叫调度组的房间并邀请003和004’时调用。"
+          "name 为用户指定的房间名称，必填；未提供名称时先询问，不要自行编造。"
+          "invite_device_ids "
+          "为邀请设备ID字符串，多个ID用英文逗号分隔，例如003,004；"
+          "保留ID前导零。不指定邀请对象时传空字符串，表示开放加入，不能理解成自"
+          "动拉入所有设备。"
+          "创建者自动进入新房间；被邀请设备自行决定是否加入。"
+          "当前返回true仅表示创建请求已发送，不代表服务端已确认创建成功；false"
+          "表示请求未发出。",
+          PropertyList({Property("name", kPropertyTypeString),
+                        Property("invite_device_ids", kPropertyTypeString,
+                                 std::string())}),
+          [&intercom](const PropertyList &p) -> ReturnValue {
+            std::vector<std::string> ids;
+            auto raw = p["invite_device_ids"].value<std::string>();
+            size_t start = 0;
+            while (start < raw.size()) {
+              auto end = raw.find(',', start);
+              ids.push_back(raw.substr(
+                  start, end == std::string::npos ? end : end - start));
+              if (end == std::string::npos)
+                break;
+              start = end + 1;
+            }
+            return intercom.CreateRoom(p["name"].value<std::string>(), ids);
+          });
+  AddTool(
+      "self.intercom.join_room",
+      "通过六位数字加入码加入或切换到已有对讲房间。用户说‘加入房间’‘切换对讲群’"
+      "‘切到频道123456’‘加入码是123456’时调用。加入成功后本机只在新房间收发对讲"
+      "音频。"
+      "code "
+      "为六位数字字符串，必须保留前导零。只给房间名称、未给加入码时先询问加入码"
+      "，"
+      "不能把房间名称或设备ID当作加入码。受限房间需要邀请权限。"
+      "当前返回true仅表示加入请求已发送，不代表已切换成功；false表示请求未发出"
+      "。",
+      PropertyList({Property("code", kPropertyTypeString)}),
+      [&intercom](const PropertyList &p) -> ReturnValue {
+        return intercom.JoinRoom(p["code"].value<std::string>());
+      });
+  AddTool("self.intercom.leave_room",
+          "退出本机当前普通对讲房间并返回默认房间。用户说‘退出房间’‘离开这个群’"
+          "‘返回默认房间’‘切回默认频道’时调用，不需要加入码。"
+          "此操作不会关闭房间、删除房间或断开对讲服务连接，也不影响其他设备。"
+          "当前返回true仅表示退出请求已发送，不代表服务端已确认；false表示请求"
+          "未发出。",
+          PropertyList(), [&intercom](const PropertyList &) -> ReturnValue {
+            return intercom.LeaveRoom();
+          });
+  AddTool("self.intercom.accept_room_invite",
+          "接受其他设备发来的对讲房间邀请，申请切换到邀请中的房间。"
+          "用户明确说‘接受房间邀请’‘同意加入邀请的群’‘接受加入码123456的邀请’时"
+          "调用。"
+          "code 为邀请通知里的六位数字加入码字符串，保留前导零。"
+          "若不知道邀请的加入码，先询问用户，不要编造；用户未明确同意时不要自动"
+          "接受。"
+          "当前返回true仅表示接受请求已发送，不代表服务端已确认加入；false表示"
+          "请求未发出。",
+          PropertyList({Property("code", kPropertyTypeString)}),
+          [&intercom](const PropertyList &p) -> ReturnValue {
+            return intercom.AcceptInvite(p["code"].value<std::string>());
+          });
+  // System tools
+  AddUserOnlyTool("self.get_system_info", "Get the system information",
+                  PropertyList(),
+                  [this](const PropertyList &properties) -> ReturnValue {
+                    auto &board = Board::GetInstance();
+                    return board.GetSystemInfoJson();
+                  });
+
+  AddUserOnlyTool("self.reboot", "Reboot the system", PropertyList(),
+                  [this](const PropertyList &properties) -> ReturnValue {
+                    auto &app = Application::GetInstance();
+                    app.Schedule([&app]() {
+                      ESP_LOGW(TAG, "User requested reboot");
+                      vTaskDelay(pdMS_TO_TICKS(1000));
+
+                      app.Reboot();
                     });
+                    return true;
+                  });
 
-    AddUserOnlyTool("self.reboot", "Reboot the system", PropertyList(),
-                    [this](const PropertyList& properties) -> ReturnValue {
-                        auto& app = Application::GetInstance();
-                        app.Schedule([&app]() {
-                            ESP_LOGW(TAG, "User requested reboot");
-                            vTaskDelay(pdMS_TO_TICKS(1000));
+  // Firmware upgrade
+  AddUserOnlyTool(
+      "self.upgrade_firmware",
+      "Upgrade firmware from a specific URL. This will download and install "
+      "the firmware, then "
+      "reboot the device.",
+      PropertyList({Property(
+          "url", kPropertyTypeString,
+          "The URL of the firmware binary file to download and install")}),
+      [this](const PropertyList &properties) -> ReturnValue {
+        auto url = properties["url"].value<std::string>();
+        ESP_LOGI(TAG, "User requested firmware upgrade from URL: %s",
+                 url.c_str());
 
-                            app.Reboot();
-                        });
-                        return true;
-                    });
-
-    // Firmware upgrade
-    AddUserOnlyTool(
-        "self.upgrade_firmware",
-        "Upgrade firmware from a specific URL. This will download and install the firmware, then "
-        "reboot the device.",
-        PropertyList({Property("url", kPropertyTypeString,
-                               "The URL of the firmware binary file to download and install")}),
-        [this](const PropertyList& properties) -> ReturnValue {
-            auto url = properties["url"].value<std::string>();
-            ESP_LOGI(TAG, "User requested firmware upgrade from URL: %s", url.c_str());
-
-            auto& app = Application::GetInstance();
-            app.Schedule([url, &app]() {
-                bool success = app.UpgradeFirmware(url);
-                if (!success) {
-                    ESP_LOGE(TAG, "Firmware upgrade failed");
-                }
-            });
-
-            return true;
+        auto &app = Application::GetInstance();
+        app.Schedule([url, &app]() {
+          bool success = app.UpgradeFirmware(url);
+          if (!success) {
+            ESP_LOGE(TAG, "Firmware upgrade failed");
+          }
         });
 
-    // Display control
+        return true;
+      });
+
+  // Display control
 #ifdef HAVE_LVGL
-    auto display = Board::GetInstance().GetDisplay();
-    if (display != nullptr && display->SupportsGuiOperations()) {
-        AddUserOnlyTool("self.screen.get_info",
-                        "Information about the screen, including width, height, etc.",
-                        PropertyList(), [display](const PropertyList& properties) -> ReturnValue {
-                            cJSON* json = cJSON_CreateObject();
-                            cJSON_AddNumberToObject(json, "width", display->width());
-                            cJSON_AddNumberToObject(json, "height", display->height());
-                            cJSON_AddBoolToObject(json, "monochrome", display->IsMonochrome());
-                            return json;
-                        });
+  auto display = Board::GetInstance().GetDisplay();
+  if (display != nullptr && display->SupportsGuiOperations()) {
+    AddUserOnlyTool(
+        "self.screen.get_info",
+        "Information about the screen, including width, height, etc.",
+        PropertyList(),
+        [display](const PropertyList &properties) -> ReturnValue {
+          cJSON *json = cJSON_CreateObject();
+          cJSON_AddNumberToObject(json, "width", display->width());
+          cJSON_AddNumberToObject(json, "height", display->height());
+          cJSON_AddBoolToObject(json, "monochrome", display->IsMonochrome());
+          return json;
+        });
 
 #if CONFIG_LV_USE_SNAPSHOT
-        AddUserOnlyTool(
-            "self.screen.snapshot", "Snapshot the screen and upload it to a specific URL",
-            PropertyList({Property("url", kPropertyTypeString),
-                          Property("quality", kPropertyTypeInteger, 80, 1, 100)}),
-            [display](const PropertyList& properties) -> ToolResult {
-                auto url = properties["url"].value<std::string>();
-                auto quality = properties["quality"].value<int>();
+    AddUserOnlyTool(
+        "self.screen.snapshot",
+        "Snapshot the screen and upload it to a specific URL",
+        PropertyList({Property("url", kPropertyTypeString),
+                      Property("quality", kPropertyTypeInteger, 80, 1, 100)}),
+        [display](const PropertyList &properties) -> ToolResult {
+          auto url = properties["url"].value<std::string>();
+          auto quality = properties["quality"].value<int>();
 
-                std::string jpeg_data;
-                if (!display->SnapshotToJpeg(jpeg_data, quality)) {
-                    return std::unexpected("Failed to snapshot screen");
-                }
+          std::string jpeg_data;
+          if (!display->SnapshotToJpeg(jpeg_data, quality)) {
+            return std::unexpected("Failed to snapshot screen");
+          }
 
-                ESP_LOGI(TAG, "Upload snapshot %u bytes to %s", jpeg_data.size(), url.c_str());
+          ESP_LOGI(TAG, "Upload snapshot %u bytes to %s", jpeg_data.size(),
+                   url.c_str());
 
-                // 构造multipart/form-data请求体
-                std::string boundary = "----ESP32_SCREEN_SNAPSHOT_BOUNDARY";
+          // 构造multipart/form-data请求体
+          std::string boundary = "----ESP32_SCREEN_SNAPSHOT_BOUNDARY";
 
-                auto http = Board::GetInstance().GetNetwork()->CreateHttp(3);
-                http->SetHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
-                if (auto opened = http->Open("POST", url); !opened) {
-                    return std::unexpected("Failed to open URL: " + url + " (" +
-                                           opened.error().ToString() + ")");
-                }
-                auto write_or_fail = [&http](const char* data,
-                                             size_t size) -> std::optional<std::string> {
-                    if (auto written = http->Write(data, size); !written) {
-                        return written.error().ToString();
-                    }
-                    return std::nullopt;
-                };
-                {
-                    // 文件字段头部
-                    std::string file_header;
-                    file_header += "--" + boundary + "\r\n";
-                    file_header +=
-                        "Content-Disposition: form-data; name=\"file\"; "
-                        "filename=\"screenshot.jpg\"\r\n";
-                    file_header += "Content-Type: image/jpeg\r\n";
-                    file_header += "\r\n";
-                    if (auto error = write_or_fail(file_header.c_str(), file_header.size());
-                        error) {
-                        http->Close();
-                        return std::unexpected("Failed to upload screenshot: " + *error);
-                    }
-                }
+          auto http = Board::GetInstance().GetNetwork()->CreateHttp(3);
+          http->SetHeader("Content-Type",
+                          "multipart/form-data; boundary=" + boundary);
+          if (auto opened = http->Open("POST", url); !opened) {
+            return std::unexpected("Failed to open URL: " + url + " (" +
+                                   opened.error().ToString() + ")");
+          }
+          auto write_or_fail =
+              [&http](const char *data,
+                      size_t size) -> std::optional<std::string> {
+            if (auto written = http->Write(data, size); !written) {
+              return written.error().ToString();
+            }
+            return std::nullopt;
+          };
+          {
+            // 文件字段头部
+            std::string file_header;
+            file_header += "--" + boundary + "\r\n";
+            file_header += "Content-Disposition: form-data; name=\"file\"; "
+                           "filename=\"screenshot.jpg\"\r\n";
+            file_header += "Content-Type: image/jpeg\r\n";
+            file_header += "\r\n";
+            if (auto error =
+                    write_or_fail(file_header.c_str(), file_header.size());
+                error) {
+              http->Close();
+              return std::unexpected("Failed to upload screenshot: " + *error);
+            }
+          }
 
-                // JPEG数据
-                if (auto error = write_or_fail((const char*)jpeg_data.data(), jpeg_data.size());
-                    error) {
-                    http->Close();
-                    return std::unexpected("Failed to upload screenshot: " + *error);
-                }
+          // JPEG数据
+          if (auto error = write_or_fail((const char *)jpeg_data.data(),
+                                         jpeg_data.size());
+              error) {
+            http->Close();
+            return std::unexpected("Failed to upload screenshot: " + *error);
+          }
 
-                {
-                    // multipart尾部
-                    std::string multipart_footer;
-                    multipart_footer += "\r\n--" + boundary + "--\r\n";
-                    if (auto error =
-                            write_or_fail(multipart_footer.c_str(), multipart_footer.size());
-                        error) {
-                        http->Close();
-                        return std::unexpected("Failed to upload screenshot: " + *error);
-                    }
-                }
-                if (auto error = write_or_fail("", 0); error) {
-                    http->Close();
-                    return std::unexpected("Failed to upload screenshot: " + *error);
-                }
+          {
+            // multipart尾部
+            std::string multipart_footer;
+            multipart_footer += "\r\n--" + boundary + "--\r\n";
+            if (auto error = write_or_fail(multipart_footer.c_str(),
+                                           multipart_footer.size());
+                error) {
+              http->Close();
+              return std::unexpected("Failed to upload screenshot: " + *error);
+            }
+          }
+          if (auto error = write_or_fail("", 0); error) {
+            http->Close();
+            return std::unexpected("Failed to upload screenshot: " + *error);
+          }
 
-                auto upload_status = http->GetStatusCode();
-                if (!upload_status) {
-                    return std::unexpected(upload_status.error().ToString());
-                }
-                if (*upload_status != 200) {
-                    return std::unexpected("Unexpected status code: " +
-                                           std::to_string(*upload_status));
-                }
-                std::string result = http->ReadAll();
-                http->Close();
-                ESP_LOGI(TAG, "Snapshot screen result: %s", result.c_str());
-                return true;
-            });
+          auto upload_status = http->GetStatusCode();
+          if (!upload_status) {
+            return std::unexpected(upload_status.error().ToString());
+          }
+          if (*upload_status != 200) {
+            return std::unexpected("Unexpected status code: " +
+                                   std::to_string(*upload_status));
+          }
+          std::string result = http->ReadAll();
+          http->Close();
+          ESP_LOGI(TAG, "Snapshot screen result: %s", result.c_str());
+          return true;
+        });
 
-        AddUserOnlyTool(
-            "self.screen.preview_image", "Preview an image on the screen",
-            PropertyList({Property("url", kPropertyTypeString)}),
-            [display](const PropertyList& properties) -> ToolResult {
-                auto url = properties["url"].value<std::string>();
-                auto http = Board::GetInstance().GetNetwork()->CreateHttp(3);
+    AddUserOnlyTool(
+        "self.screen.preview_image", "Preview an image on the screen",
+        PropertyList({Property("url", kPropertyTypeString)}),
+        [display](const PropertyList &properties) -> ToolResult {
+          auto url = properties["url"].value<std::string>();
+          auto http = Board::GetInstance().GetNetwork()->CreateHttp(3);
 
-                if (auto opened = http->Open("GET", url); !opened) {
-                    return std::unexpected("Failed to open URL: " + url + " (" +
-                                           opened.error().ToString() + ")");
-                }
-                auto status_code = http->GetStatusCode();
-                if (!status_code) {
-                    return std::unexpected(status_code.error().ToString());
-                }
-                if (*status_code != 200) {
-                    return std::unexpected("Unexpected status code: " +
-                                           std::to_string(*status_code));
-                }
+          if (auto opened = http->Open("GET", url); !opened) {
+            return std::unexpected("Failed to open URL: " + url + " (" +
+                                   opened.error().ToString() + ")");
+          }
+          auto status_code = http->GetStatusCode();
+          if (!status_code) {
+            return std::unexpected(status_code.error().ToString());
+          }
+          if (*status_code != 200) {
+            return std::unexpected("Unexpected status code: " +
+                                   std::to_string(*status_code));
+          }
 
-                size_t content_length = http->GetBodyLength();
-                using BufferPtr = std::unique_ptr<char, decltype(&heap_caps_free)>;
-                BufferPtr data(
-                    static_cast<char*>(heap_caps_malloc(content_length, MALLOC_CAP_8BIT)),
-                    heap_caps_free);
-                if (data == nullptr) {
-                    return std::unexpected("Failed to allocate memory for image: " + url);
-                }
-                size_t total_read = 0;
-                while (total_read < content_length) {
-                    auto ret = http->Read(data.get() + total_read, content_length - total_read);
-                    if (!ret) {
-                        return std::unexpected("Failed to download image: " + url);
-                    }
-                    if (*ret == 0) {
-                        break;
-                    }
-                    total_read += *ret;
-                }
-                http->Close();
+          size_t content_length = http->GetBodyLength();
+          using BufferPtr = std::unique_ptr<char, decltype(&heap_caps_free)>;
+          BufferPtr data(static_cast<char *>(
+                             heap_caps_malloc(content_length, MALLOC_CAP_8BIT)),
+                         heap_caps_free);
+          if (data == nullptr) {
+            return std::unexpected("Failed to allocate memory for image: " +
+                                   url);
+          }
+          size_t total_read = 0;
+          while (total_read < content_length) {
+            auto ret = http->Read(data.get() + total_read,
+                                  content_length - total_read);
+            if (!ret) {
+              return std::unexpected("Failed to download image: " + url);
+            }
+            if (*ret == 0) {
+              break;
+            }
+            total_read += *ret;
+          }
+          http->Close();
 
-                auto image = std::make_unique<LvglAllocatedImage>(data.release(), total_read);
-                if (!image->IsValid()) {
-                    return std::unexpected("Downloaded image is invalid: " + url);
-                }
-                display->SetPreviewImage(std::move(image));
-                return true;
-            });
-#endif  // CONFIG_LV_USE_SNAPSHOT
-    }
-#endif  // HAVE_LVGL
+          auto image =
+              std::make_unique<LvglAllocatedImage>(data.release(), total_read);
+          if (!image->IsValid()) {
+            return std::unexpected("Downloaded image is invalid: " + url);
+          }
+          display->SetPreviewImage(std::move(image));
+          return true;
+        });
+#endif // CONFIG_LV_USE_SNAPSHOT
+  }
+#endif // HAVE_LVGL
 
-    // Assets download url (always registered — Settings storage works regardless of partition
-    // layout)
-    AddUserOnlyTool("self.assets.set_download_url", "Set the download url for the assets",
-                    PropertyList({Property("url", kPropertyTypeString)}),
-                    [](const PropertyList& properties) -> ReturnValue {
-                        auto url = properties["url"].value<std::string>();
-                        Settings settings("assets", true);
-                        settings.SetString("download_url", url);
-                        return true;
-                    });
+  // Assets download url (always registered — Settings storage works regardless
+  // of partition layout)
+  AddUserOnlyTool("self.assets.set_download_url",
+                  "Set the download url for the assets",
+                  PropertyList({Property("url", kPropertyTypeString)}),
+                  [](const PropertyList &properties) -> ReturnValue {
+                    auto url = properties["url"].value<std::string>();
+                    Settings settings("assets", true);
+                    settings.SetString("download_url", url);
+                    return true;
+                  });
 }
 
 void McpServer::AddTool(std::unique_ptr<McpTool> tool) {
@@ -572,66 +675,88 @@ void McpServer::GetToolsList(int id, const std::string& cursor, bool list_user_o
     ReplyResult(id, json, response_sender);
 }
 
-void McpServer::DoToolCall(int id, const std::string& tool_name, const cJSON* tool_arguments,
+void McpServer::DoToolCall(int id, const std::string &tool_name,
+                           const cJSON *tool_arguments,
                            ResponseSender response_sender) {
-    auto tool_iter = std::find_if(tools_.begin(), tools_.end(), [&tool_name](const auto& tool) {
-        return tool->name() == tool_name;
-    });
+  auto tool_iter = std::find_if(
+      tools_.begin(), tools_.end(),
+      [&tool_name](const auto &tool) { return tool->name() == tool_name; });
 
-    if (tool_iter == tools_.end()) {
-        ESP_LOGE(TAG, "tools/call: Unknown tool: %s", tool_name.c_str());
-        ReplyError(id, -32602, "Unknown tool: " + tool_name, response_sender);
+  if (tool_iter == tools_.end()) {
+    ESP_LOGE(TAG, "tools/call: Unknown tool: %s", tool_name.c_str());
+    ReplyError(id, -32602, "Unknown tool: " + tool_name, response_sender);
+    return;
+  }
+
+  McpTool *tool = tool_iter->get();
+  PropertyList arguments = tool->properties();
+  for (auto &argument : arguments) {
+    bool found = false;
+    std::expected<void, std::string> validation;
+    if (cJSON_IsObject(tool_arguments)) {
+      auto value = cJSON_GetObjectItem(tool_arguments, argument.name().c_str());
+      if (argument.type() == kPropertyTypeBoolean && cJSON_IsBool(value)) {
+        validation = argument.set_value<bool>(value->valueint == 1);
+        found = true;
+      } else if (argument.type() == kPropertyTypeInteger &&
+                 cJSON_IsNumber(value)) {
+        validation = argument.set_value<int>(value->valueint);
+        found = true;
+      } else if (argument.type() == kPropertyTypeString &&
+                 cJSON_IsString(value)) {
+        validation = argument.set_value<std::string>(value->valuestring);
+        found = true;
+      } else if (value != nullptr) {
+        ESP_LOGE(TAG, "tools/call: Invalid type for argument: %s",
+                 argument.name().c_str());
+        ReplyError(id, -32602, "Invalid type for argument: " + argument.name(),
+                   response_sender);
         return;
+      }
     }
 
-    McpTool* tool = tool_iter->get();
-    PropertyList arguments = tool->properties();
-    for (auto& argument : arguments) {
-        bool found = false;
-        std::expected<void, std::string> validation;
-        if (cJSON_IsObject(tool_arguments)) {
-            auto value = cJSON_GetObjectItem(tool_arguments, argument.name().c_str());
-            if (argument.type() == kPropertyTypeBoolean && cJSON_IsBool(value)) {
-                validation = argument.set_value<bool>(value->valueint == 1);
-                found = true;
-            } else if (argument.type() == kPropertyTypeInteger && cJSON_IsNumber(value)) {
-                validation = argument.set_value<int>(value->valueint);
-                found = true;
-            } else if (argument.type() == kPropertyTypeString && cJSON_IsString(value)) {
-                validation = argument.set_value<std::string>(value->valuestring);
-                found = true;
-            } else if (value != nullptr) {
-                ESP_LOGE(TAG, "tools/call: Invalid type for argument: %s", argument.name().c_str());
-                ReplyError(id, -32602, "Invalid type for argument: " + argument.name(),
-                           response_sender);
-                return;
-            }
-        }
-
-        if (found && !validation) {
-            ESP_LOGE(TAG, "tools/call: %s", validation.error().c_str());
-            ReplyError(id, -32602, validation.error(), response_sender);
-            return;
-        }
-
-        if (!argument.has_default_value() && !found) {
-            ESP_LOGE(TAG, "tools/call: Missing required argument: %s", argument.name().c_str());
-            ReplyError(id, -32602, "Missing required argument: " + argument.name(),
-                       response_sender);
-            return;
-        }
+    if (found && !validation) {
+      ESP_LOGE(TAG, "tools/call: %s", validation.error().c_str());
+      ReplyError(id, -32602, validation.error(), response_sender);
+      return;
     }
 
-    // Use main thread to call the tool
-    auto& app = Application::GetInstance();
-    app.Schedule([this, id, tool, arguments = std::move(arguments),
-                  response_sender = std::move(response_sender)]() {
-        auto result = tool->Call(arguments);
-        if (!result) {
-            ESP_LOGE(TAG, "tools/call: %s", result.error().c_str());
-            ReplyError(id, result.error(), response_sender);
-            return;
-        }
-        ReplyResult(id, *result, response_sender);
-    });
+    if (!argument.has_default_value() && !found) {
+      ESP_LOGE(TAG, "tools/call: Missing required argument: %s",
+               argument.name().c_str());
+      ReplyError(id, -32602, "Missing required argument: " + argument.name(),
+                 response_sender);
+      return;
+    }
+  }
+
+  // Use main thread to call the tool
+  auto &app = Application::GetInstance();
+  auto invoke = [this, id, tool, arguments = std::move(arguments),
+                 response_sender]() {
+    auto result = tool->Call(arguments);
+    if (!result) {
+      ESP_LOGE(TAG, "tools/call: %s", result.error().c_str());
+      ReplyError(id, result.error(), response_sender);
+      return;
+    }
+    ReplyResult(id, *result, response_sender);
+  };
+  if (tool_name == "self.intercom.list_rooms") {
+    // This tool waits for a network response; never block Application.
+    auto work = new std::function<void()>(std::move(invoke));
+    if (xTaskCreate(
+            [](void *context) {
+              auto task = static_cast<std::function<void()> *>(context);
+              (*task)();
+              delete task;
+              vTaskDelete(nullptr);
+            },
+            "intercom_rooms", 8192, work, 2, nullptr) != pdPASS) {
+      delete work;
+      ReplyError(id, "Cannot start room query task", response_sender);
+    }
+  } else {
+    app.Schedule(std::move(invoke));
+  }
 }

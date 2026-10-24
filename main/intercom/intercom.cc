@@ -1,10 +1,10 @@
 #include "intercom.h"
 
 #include "application.h"
+#include "assets/lang_config.h"
 #include "board.h"
 #include "display.h"
 #include "settings.h"
-#include "assets/lang_config.h"
 
 #include <cJSON.h>
 #include <esp_heap_caps.h>
@@ -150,6 +150,51 @@ const char *Intercom::Status() const {
 
 void Intercom::SetState(State state) { state_ = state; }
 
+std::string Intercom::ListRooms() {
+  std::unique_lock<std::mutex> lock(rooms_mutex_);
+  if (!rooms_request_id_.empty())
+    return "{\"ok\":false,\"error\":\"room query busy\"}";
+  if (state_ == State::Disabled || state_ == State::Disconnected ||
+      state_ == State::Connecting)
+    return "{\"ok\":false,\"error\":\"intercom disconnected\"}";
+  rooms_request_id_ = std::to_string(esp_random());
+  rooms_response_.clear();
+  QueueText("{\"type\":\"list_rooms\",\"request_id\":\"" + rooms_request_id_ +
+            "\"}");
+  bool received = rooms_cv_.wait_for(lock, std::chrono::seconds(5), [this]() {
+    return !rooms_response_.empty();
+  });
+  rooms_request_id_.clear();
+  return received ? rooms_response_
+                  : "{\"ok\":false,\"error\":\"room query timed out\"}";
+}
+
+bool Intercom::CreateRoom(const std::string &name,
+                          const std::vector<std::string> &invite_ids) {
+  if (!ws_ || !ws_->IsConnected() || name.empty())
+    return false;
+  cJSON *root = cJSON_CreateObject();
+  cJSON_AddStringToObject(root, "type", "create_room");
+  cJSON_AddStringToObject(root, "name", name.c_str());
+  cJSON_AddStringToObject(root, "creator_device_id", id_.c_str());
+  cJSON *ids = cJSON_AddArrayToObject(root, "invite_device_ids");
+  for (const auto &id : invite_ids)
+    cJSON_AddItemToArray(ids, cJSON_CreateString(id.c_str()));
+  char *raw = cJSON_PrintUnformatted(root);
+  bool ok = SendText(raw);
+  cJSON_free(raw);
+  cJSON_Delete(root);
+  return ok;
+}
+bool Intercom::JoinRoom(const std::string &code) {
+  return SendText("{\"type\":\"join_room\",\"code\":\"" + code + "\"}");
+}
+bool Intercom::LeaveRoom() { return SendText("{\"type\":\"leave_room\"}"); }
+bool Intercom::AcceptInvite(const std::string &code) {
+  return SendText("{\"type\":\"accept_room_invite\",\"code\":\"" + code +
+                  "\"}");
+}
+
 void Intercom::ResumeAssistantAudio() {
   if (app_.GetDeviceState() == kDeviceStateIdle)
     app_.GetAudioService().EnableWakeWordDetection(true);
@@ -172,7 +217,9 @@ void Intercom::Press() {
   }
   if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) < kMinFreePsram) {
     ESP_LOGW(kTag, "Cannot start realtime talk: free PSRAM below reserve");
-    app_.Schedule([this]() { Board::GetInstance().GetDisplay()->ShowNotification("PSRAM不足"); });
+    app_.Schedule([this]() {
+      Board::GetInstance().GetDisplay()->ShowNotification("PSRAM不足");
+    });
     return;
   }
   app_.GetAudioService().EnableWakeWordDetection(false);
@@ -187,10 +234,11 @@ void Intercom::Press() {
   start_ok_ = false;
   end_ok_ = false;
   end_pending_ = false;
-  start_sent_ = SendText("{\"type\":\"start\",\"message_id\":\"" +
-                         message_id_ + "\",\"frame_ms\":60,\"sample_rate\":16000}");
+  start_sent_ = SendText("{\"type\":\"start\",\"message_id\":\"" + message_id_ +
+                         "\",\"frame_ms\":60,\"sample_rate\":16000}");
   if (!start_sent_) {
-    ESP_LOGW(kTag, "Failed to send realtime start message=%s", message_id_.c_str());
+    ESP_LOGW(kTag, "Failed to send realtime start message=%s",
+             message_id_.c_str());
     ResumeAssistantAudio();
     return;
   }
@@ -332,7 +380,8 @@ void Intercom::RecordTask() {
     {
       std::lock_guard<std::mutex> lock(frame_mutex_);
       if (outgoing_frames_.size() >= kRealtimeFrameQueue) {
-        ESP_LOGW(kTag, "Realtime send queue full message=%s frames=%d", message_id_.c_str(), frame_count_);
+        ESP_LOGW(kTag, "Realtime send queue full message=%s frames=%d",
+                 message_id_.c_str(), frame_count_);
         session_failed_ = true;
         break;
       }
@@ -397,9 +446,7 @@ void Intercom::FlushControl() {
     }
 }
 
-void Intercom::Upload() {
-  SendRealtimeFrames();
-}
+void Intercom::Upload() { SendRealtimeFrames(); }
 
 void Intercom::SendRealtimeFrames() {
   std::vector<uint8_t> frame;
@@ -414,22 +461,26 @@ void Intercom::SendRealtimeFrames() {
   }
   if (!frame.empty() && ws_ && ws_->IsConnected()) {
     if (!ws_->Send(frame.data(), frame.size(), true)) {
-      ESP_LOGW(kTag, "Realtime frame send failed message=%s", message_id_.c_str());
+      ESP_LOGW(kTag, "Realtime frame send failed message=%s",
+               message_id_.c_str());
       session_failed_ = true;
     } else if (frame_count_ == 1) {
-      ESP_LOGD(kTag, "Realtime first frame sent message=%s bytes=%u", message_id_.c_str(), static_cast<unsigned>(frame.size()));
+      ESP_LOGD(kTag, "Realtime first frame sent message=%s bytes=%u",
+               message_id_.c_str(), static_cast<unsigned>(frame.size()));
     }
   }
   if (end_pending_ && queue_empty && !record_task_active_ && !end_ok_) {
     if (SendText("{\"type\":\"end\",\"message_id\":\"" + message_id_ +
                  "\",\"frame_count\":" + std::to_string(frame_count_) + "}")) {
-      ESP_LOGI(kTag, "Realtime end sent message=%s frames=%d", message_id_.c_str(), frame_count_);
+      ESP_LOGI(kTag, "Realtime end sent message=%s frames=%d",
+               message_id_.c_str(), frame_count_);
       end_pending_ = false;
       SetState(State::Sending);
     }
   }
   if (state_ == State::Sending && end_ok_) {
-    SetState(network_ && ws_ && ws_->IsConnected() ? State::Ready : State::Disconnected);
+    SetState(network_ && ws_ && ws_->IsConnected() ? State::Ready
+                                                   : State::Disconnected);
     ResumeAssistantAudio();
   }
 }
@@ -460,7 +511,8 @@ void Intercom::OnData(const char *data, size_t len, bool binary) {
     packet->payload.assign(data, data + len);
     std::lock_guard<std::mutex> lock(incoming_mutex_);
     if (incoming_buffer_.size() >= 12) {
-      ESP_LOGW(kTag, "Receive jitter buffer full message=%s frames=%d", incoming_id_.c_str(), incoming_frames_);
+      ESP_LOGW(kTag, "Receive jitter buffer full message=%s frames=%d",
+               incoming_id_.c_str(), incoming_frames_);
       incoming_id_.clear();
       incoming_buffer_.clear();
       incoming_playback_started_ = false;
@@ -469,18 +521,23 @@ void Intercom::OnData(const char *data, size_t len, bool binary) {
     }
     incoming_buffer_.push_back(std::move(packet));
     ++incoming_frames_;
-    if (incoming_initialized_ && (incoming_playback_started_ || incoming_buffer_.size() >= static_cast<size_t>(incoming_buffer_target_))) {
+    if (incoming_initialized_ &&
+        (incoming_playback_started_ ||
+         incoming_buffer_.size() >=
+             static_cast<size_t>(incoming_buffer_target_))) {
       incoming_playback_started_ = true;
       while (!incoming_buffer_.empty()) {
-        if (!app_.GetAudioService().TryPushPacketToDecodeQueue(incoming_buffer_.front()))
+        if (!app_.GetAudioService().TryPushPacketToDecodeQueue(
+                incoming_buffer_.front()))
           break;
         incoming_buffer_.pop_front();
       }
-      ESP_LOGD(kTag, "Receive jitter buffer primed message=%s frames=%d", incoming_id_.c_str(), incoming_frames_);
+      ESP_LOGD(kTag, "Receive jitter buffer primed message=%s frames=%d",
+               incoming_id_.c_str(), incoming_frames_);
     }
     return;
   }
-  if (len > 1024)
+  if (len > 8192)
     return;
   cJSON *json = cJSON_ParseWithLength(data, len);
   if (!json)
@@ -491,7 +548,19 @@ void Intercom::OnData(const char *data, size_t len, bool binary) {
   auto room_name = cJSON_GetObjectItem(json, "room_name");
   const char *name = cJSON_IsString(type) ? type->valuestring : "";
   const char *mid = cJSON_IsString(id) ? id->valuestring : "";
-  if (cJSON_IsString(room_name)) room_name_ = room_name->valuestring;
+  if (!strcmp(name, "list_rooms_ack")) {
+    auto request = cJSON_GetObjectItem(json, "request_id");
+    std::lock_guard<std::mutex> lock(rooms_mutex_);
+    if (cJSON_IsString(request) && !rooms_request_id_.empty() &&
+        rooms_request_id_ == request->valuestring) {
+      rooms_response_.assign(data, len);
+      rooms_cv_.notify_all();
+    }
+    cJSON_Delete(json);
+    return;
+  }
+  if (cJSON_IsString(room_name))
+    room_name_ = room_name->valuestring;
   if (!strcmp(name, "hello_ack"))
     hello_ok_ = cJSON_IsTrue(ok);
   else if (!strcmp(name, "start_ack") && message_id_ == mid) {
@@ -538,13 +607,16 @@ void Intercom::OnData(const char *data, size_t len, bool binary) {
     {
       std::lock_guard<std::mutex> lock(incoming_mutex_);
       while (!incoming_buffer_.empty()) {
-        if (!app_.GetAudioService().TryPushPacketToDecodeQueue(incoming_buffer_.front()))
+        if (!app_.GetAudioService().TryPushPacketToDecodeQueue(
+                incoming_buffer_.front()))
           break;
         incoming_buffer_.pop_front();
       }
       if (!incoming_buffer_.empty()) {
-        ESP_LOGW(kTag, "Dropping %u buffered frames at receive end: decode queue full",
-                 static_cast<unsigned>(incoming_buffer_.size()));
+        ESP_LOGW(
+            kTag,
+            "Dropping %u buffered frames at receive end: decode queue full",
+            static_cast<unsigned>(incoming_buffer_.size()));
         incoming_buffer_.clear();
       }
       incoming_playback_started_ = false;
