@@ -28,6 +28,7 @@ public:
   bool Busy() const;
   bool IsRecording() const;
   const char *Status() const;
+  const char *RoomName() const { return room_name_.c_str(); }
   bool CanRecord() const;
 
 private:
@@ -49,6 +50,7 @@ private:
   std::atomic<bool> record_task_active_{false};
   std::string id_;
   std::string url_;
+  std::string room_name_ = "默认房间";
   std::string message_id_;
   std::string incoming_id_;
   std::shared_ptr<WebSocket> ws_;
